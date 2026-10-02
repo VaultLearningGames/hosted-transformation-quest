@@ -1,69 +1,99 @@
 name: Transformation Quest Build & Deploy
 
-on: 
+# Builds the web client (web/, a static React app) and publishes it to Vault's test-build CDN as the
+# University of Calgary studio:
+#   https://builds.vaultlearninggames.org/ucalgary/transformation-quest/<branch or tag>/
+#   (https://builds.vaultlearninggames-staging.org/... while VAULT_PUBLISHER_URL points at the staging portal)
+# Deleting a branch removes its preview.
+#
+# Only web/ is published. The Vault CDN hosts static files, so the data collection server (server/) is not part of
+# this: the build leaves REACT_APP_DATA_COLLECTION_BASE_URL unset, which turns the client's /api calls off (as the
+# Field Day build always did). Play data still goes to OpenGameData.
+#
+# Vault knows this repository belongs to the University of Calgary because the portal assigns it to that studio
+# (Vault → Studios → University of Calgary → Repositories that publish for this studio, or studios.json in
+# VaultLearningGames/vault-publisher). Without that, a VaultLearningGames repository publishes as the "vault" studio,
+# which the `check-studio` job below reports as a failure.
+#
+# Which portal: the VAULT_PUBLISHER_URL variable. The organization's value is the production portal; this
+# repository overrides it with a repository variable while it publishes to staging.
+#
+# Releases: push a version tag (e.g. v1.0), test it, then Request release in the portal.
+on:
   push:
-    branches:
-    - develop
+  delete:
   workflow_dispatch:
 
-env:
-  NODE_VERSION: 16.x
+# publish-preview.yml authenticates to the portal with this workflow's OIDC token; a called workflow can't be given
+# more than its caller has, so id-token is granted here.
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   build:
-    name: Build npm project
-    runs-on: ubuntu-20.04
+    name: Build the web client
+    if: github.event_name != 'delete'
+    runs-on: ubuntu-latest
     concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}
+      group: build-${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
-
+    permissions:
+      contents: read
+    outputs:
+      artifact: web-${{ github.sha }}
+    defaults:
+      run:
+        working-directory: web
     steps:
-    # Install and connect to VPN
-      - name: Install OpenConnect
-        run: sudo apt-get update && sudo apt-get install openconnect
+    - uses: actions/checkout@v7
 
-      - name: Connect to VPN
-        run: echo ${{ secrets.FIELDDAY_VPN_PASSWORD }} | sudo openconnect --protocol=gp -u ${{ secrets.FIELDDAY_VPN_USERNAME }} --passwd-on-stdin soe.vpn.wisc.edu &
-    # Setup repo  
-      - name: Checkout repository
-        uses: actions/checkout@v3
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 24
+        cache: npm
+        cache-dependency-path: web/package-lock.json
 
-      - name: Extract branch name
-        shell: bash
-        run: echo "BRANCH=$(echo ${GITHUB_REF#refs/heads/} | sed 's/\//_/g')" >> $GITHUB_ENV
+    - run: npm ci
 
-      - name: Extract version name
-        shell: bash
-        run: echo "VERSION=$(echo ${GITHUB_REF#refs/tags/} | sed 's/\//_/g')" >> $GITHUB_ENV      
-     # Build
-      - name: Setup Node
-        uses: actions/setup-node@v3
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: "npm"
+    # Relative asset paths and hash routes (…/#/level/3): one build plays from any folder, which Vault needs
+    # because a release is the tested build copied, unchanged, to another address.
+    - run: npm run build-vault
 
-      - name: Install Package
-        run: npm install
+    - name: Check the build
+      run: test -f build/index.html || { echo "::error::web/build has no index.html"; exit 1; }
 
-      - name: Remove old builds
-        run: rm -rf web/build
-        
-      - name: Build
-        # TODO: find/define best build script for our purposes
-        run: cd web && npm run build-fieldday-develop
+    - uses: actions/upload-artifact@v7
+      with:
+        name: web-${{ github.sha }}
+        path: web/build
+        retention-days: 14
+        if-no-files-found: error
 
-      - name: Upload build
-        uses: actions/upload-artifact@v3
-        with: 
-          name: transformation_quest_${{ env.VERSION }}
-          path: web/build
+  preview:
+    needs: build
+    uses: VaultLearningGames/vault-publisher/.github/workflows/publish-preview.yml@v1
+    with:
+      game: transformation-quest
+      artifact: ${{ needs.build.outputs.artifact }}
 
-      - name: Upload to web server via rsync
-        uses: burnett01/rsync-deployments@5.2
-        with:
-          switches: -avzr --delete --rsync-path "mkdir -p ${{ secrets.DEPLOY_DIR }}/${{ env.BRANCH }} && rsync"
-          path: web/build/*
-          remote_path: ${{ secrets.DEPLOY_DIR }}/${{ env.BRANCH }}
-          remote_host: ${{ secrets.FIELDDAY_WISC_EDU_DEPLOY_HOST }}
-          remote_user: ${{ secrets.FIELDDAY_WISC_EDU_DEPLOY_USER }}
-          remote_key: ${{ secrets.FIELDDAY_WISC_EDU_DEPLOY_KEY }}          
+  # The portal decides the studio from the repository. Fail loudly if the build landed anywhere else.
+  check-studio:
+    needs: preview
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+    - name: Published as University of Calgary
+      env:
+        URL: ${{ needs.preview.outputs.url }}
+      run: |
+        case "$URL" in
+          */ucalgary/transformation-quest/*) echo "Published to $URL" ;;
+          *) echo "::error::Published to $URL, not to ucalgary/transformation-quest: this repository isn't assigned to the University of Calgary studio in the Vault portal."; exit 1 ;;
+        esac
+
+  remove-preview:
+    if: github.event_name == 'delete'
+    uses: VaultLearningGames/vault-publisher/.github/workflows/publish-preview.yml@v1
+    with:
+      game: transformation-quest

@@ -9,8 +9,21 @@ A game by MindFuel to help teach the concepts of geometric transformations in a 
 
 ## CI
 
-Using github actions
-artifacts are produced from the CI for both staging and prod environments
+GitHub Actions (`.github/workflows/main.yml`): every push builds the web client and publishes it to
+[Vault](https://vaultlearninggames.org) as the University of Calgary studio, at
+`https://builds.vaultlearninggames.org/ucalgary/transformation-quest/<branch or tag>/` (on
+`builds.vaultlearninggames-staging.org` while the `VAULT_PUBLISHER_URL` repository variable points at the staging
+portal). Deleting a branch removes its preview. To release, push a version tag, test it, then *Request release* in the
+[Vault Studio Portal](https://portal.vaultlearninggames.org).
+
+Only `web` is published: Vault's CDN hosts static files. The build (`npm run build-vault` in `web`) uses relative
+asset paths and hash routes (`…/#/level/3`), so the same files play from any folder, and it leaves
+`REACT_APP_DATA_COLLECTION_BASE_URL` unset, so the client makes no `/api` calls: the data collection `server` is not
+deployed, and *Enter a code* on the title screen (which loads a session from that server) finds nothing. Play data
+still goes to OpenGameData.
+
+No secrets are needed: the workflow's GitHub OIDC token authenticates it, and Vault's portal assigns this repository
+to the University of Calgary studio.
 
 ## Lifecycle Scripts
 
